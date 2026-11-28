@@ -39,6 +39,7 @@ import Strata.Transform.GenOpaqueTypeParams
 import Strata.Transform.MonomorphizeFunctions
 import Strata.Transform.NondetElim
 import Strata.Transform.PrecondElim
+import Strata.Transform.SeqTotalize
 public import Strata.Transform.RecursiveFunctionAxiomsPhase
 import Strata.Transform.TerminationCheckPhase
 import Strata.Languages.Core.ObligationExtraction
@@ -2286,7 +2287,8 @@ def transformPipelinePhases (options : VerifyOptions := VerifyOptions.default)
   let cutCFGLoops := if symExecCFG then [cfgLoopElimPipelinePhase] else []
   hoistChoices ++ [typeCheckPipelinePhase options (moreFns := moreFns)] ++ filterPhases ++
     cfgCheck ++ cutCFGLoops ++
-    [callElimPipelinePhase, termCheckPipelinePhase, precondElimPipelinePhase]
+    [callElimPipelinePhase, termCheckPipelinePhase, precondElimPipelinePhase,
+      seqTotalizePipelinePhase]
     ++ postFilterPhases ++ [insertLoopInvariantAssertsPipelinePhase, loopElimPipelinePhase]
 
 /-- Symbolic-evaluation pipeline phase: partially evaluates the program into
@@ -2302,7 +2304,7 @@ def symbolicEvalPipelinePhase
   -- carries forward were established upstream; it preserves rather than
   -- re-establishes them. `noNondetGuards` is not preserved: the output separates
   -- obligations with `ite *`.
-  modelPreservingPipelinePhase "symbolicEval"
+  modelPreservingPipelinePhase "symbolicEval" (maintainsIdentPrefixes := true)
     (requires := factSet![.noCFGBodies, .noLoops, .noNondetGuards, .typeAnnotated])
     (establishes := factSet![.noCalls, .staticSingleAssignment, .hasObligationForm,
                              .noProcedureContracts, .noInits])
@@ -2310,7 +2312,8 @@ def symbolicEvalPipelinePhase
                          .noPrecondsFromFuncs,
                          .noPolymorphicProcedures,
                          .noPolymorphicFunctions, .typeAnnotated, .exitsCovered])
-    fun prog => do
+    -- Its output carries names it does not choose, so the prefixes are collected again.
+    fun prog => Transform.recollectIdentPrefixes prog do
       let (prog', stats) ← Transform.liftDiag (Core.toCoreProofObligationProgram options prog moreFns |>.mapError
         fun err => { err with message := s!"❌ Symbolic evaluation error.\n{err.message}" })
       modify fun σ => { σ with statistics := σ.statistics.merge stats }
@@ -2327,7 +2330,7 @@ def symbolicEvalPipelinePhase
 def declObligationsPipelinePhase
     (options : VerifyOptions := VerifyOptions.default)
     (moreFns : @Lambda.Factory CoreLParams := Lambda.Factory.default) : PipelinePhase :=
-  modelPreservingPipelinePhase "declObligations"
+  modelPreservingPipelinePhase "declObligations" (maintainsIdentPrefixes := true)
     (requires := factSet![.typeAnnotated])
     (establishes := factSet![])
     (preserves := factSet![.noCFGBodies, .noCalls, .noLoops, .noLoopInvariants, .noLoopMeasures,
@@ -2363,7 +2366,7 @@ def symExecPipelinePhase
     (policy : Option SymExec.MergePolicy := none) : PipelinePhase :=
   -- Its output's only procedure is the obligation procedure, whose body is structured, so it
   -- establishes `noCFGBodies` for the CFG bodies it accepts.
-  modelPreservingPipelinePhase "symExec"
+  modelPreservingPipelinePhase "symExec" (maintainsIdentPrefixes := true)
     (requires := ProgramFactSet.ofList SymExec.symExecRequires)
     (establishes := if policy.isNone && options.symExecMode == .never then
         factSet![.noCFGBodies, .staticSingleAssignment, .hasObligationForm,
@@ -2374,7 +2377,8 @@ def symExecPipelinePhase
                          .noPrecondsFromFuncs,
                          .noPolymorphicProcedures,
                          .noPolymorphicFunctions, .typeAnnotated, .exitsCovered])
-    fun prog => do
+    -- Its output carries names it does not choose, so the prefixes are collected again.
+    fun prog => Transform.recollectIdentPrefixes prog do
       let (prog', stats) ← Transform.liftDiag
         (Core.toSymExecObligationProgram options prog moreFns policy |>.mapError
           fun err => { err with message := s!"❌ Symbolic execution error.\n{err.message}" })
@@ -2393,7 +2397,10 @@ def symExecPipelinePhase
     in the transform state's factory, which holds the functions given outside the program
     (`moreFns`, which `verifyPipeline` seeds it with), so no pipeline can leave them out. -/
 def passiveVCPipelinePhase (vcMode : VCGenMode) (prefixes : List String) : PipelinePhase where
-  transform prog := do
+  maintainsIdentPrefixes := true
+  -- Its output carries names it chooses away from the program's, so the prefixes are collected
+  -- again.
+  transform prog := Transform.recollectIdentPrefixes prog do
     let F ← Transform.getFactory
     let prog' ← Transform.liftDiag
       (PassiveVC.passiveVCProgram (PassiveVC.vcModeToMethod vcMode) prog
@@ -2419,8 +2426,9 @@ def passiveVCPipelinePhase (vcMode : VCGenMode) (prefixes : List String) : Pipel
 /-- The phases `--vcgen uwp/usp` runs, in place of the whole default order: type
     checking and the procedure filters of `transformPipelinePhases` (the second filter
     after precondition elimination); CFG loop elimination, which cuts the loops of CFG
-    bodies at their headers; call elimination; the termination check and
-    precondition elimination; the invariant and measure assertions and loop
+    bodies at their headers; call elimination; the termination check,
+    precondition elimination and the rewrite of checked sequence operations to their
+    total twins; the invariant and measure assertions and loop
     elimination of structured bodies (a CFG body is left to the CFG phase); opaque
     type parameters and function monomorphization; simplification, which unfolds calls of
     recursive functions on values as in the default order (`simplifyPhase`);
@@ -2438,7 +2446,7 @@ def passiveVCGenPhases (options : VerifyOptions := VerifyOptions.default)
     -- CFG loop elimination comes before call elimination, so that the program its
     -- validation replays a model through still has its calls, whose callees replay runs.
     [cfgLoopElimPipelinePhase, callElimPipelinePhase, termCheckPipelinePhase,
-     precondElimPipelinePhase] ++ postFilterPhases ++
+     precondElimPipelinePhase, seqTotalizePipelinePhase] ++ postFilterPhases ++
     [insertLoopInvariantAssertsPipelinePhase, loopElimPipelinePhase,
      genOpaqueTypeParamsPipelinePhase,
      monomorphizeFunctionsPipelinePhase,
@@ -3548,6 +3556,11 @@ def verifyPipeline (program : Program)
       (initState := { Transform.CoreTransformState.emp with factory := factory })
       (pipelineCtx := some pctx)
       (keepAllFilesPrefix := options.keepAllFilesPrefix)
+    -- The warnings the phases report, such as a pass's prefix conflicting with the program's
+    -- names (`Transform.withClaimedPrefixes`), unless the caller asked for quiet output.
+    if options.verbose >= .normal then
+      for w in state.warnings do
+        IO.toEIO (fun e => Message.fromFormat f!"{e}") (IO.eprintln s!"[warning] {w.message}")
     pure (prog, state.factory, state.statistics, inputs)
   -- A phase that validates models against its input gets the input it was given.
   let phases := (pipelinePhases.zipIdx.map fun (p, i) =>
